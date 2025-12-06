@@ -1,6 +1,5 @@
 /* Includes ---------------------------------------------------------------- */
-// IMPORTANTE: Substitua a linha abaixo pelo nome da biblioteca que você baixou do Edge Impulse
-// Exemplo: #include <Seu_Projeto_inferencing.h>
+// IMPORTANTE: Substitua pela sua biblioteca
 #include <Lazaro-Lorenzi-project-1_inferencing.h>
 
 #include <Arduino.h>
@@ -9,8 +8,21 @@
 #include <Adafruit_BNO055.h>
 #include <utility/imumaths.h>
 
+// --- NOVAS BIBLIOTECAS PARA MQTT ---
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+/* Configurações de Wi-Fi e MQTT ------------------------------------------- */
+const char* ssid = "AMF-CORP";          // <<<< COLOQUE O NOME DO SEU WIFI
+const char* password = "@MF$4515";     // <<<< COLOQUE A SENHA
+const char* mqtt_server = "test.mosquitto.org";        // <<<< IP DO SEU COMPUTADOR/BROKER (ou "broker.hivemq.com" para teste publico)
+const int mqtt_port = 1883;
+const char* mqtt_topic = "esp32lazaro/movimento";     // Tópico onde a mensagem será publicada
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
 /* Configurações do BNO055 */
-// Pinos I2C definidos para ESP32
 #define SDA_PIN 23
 #define SCL_PIN 22
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
@@ -21,8 +33,12 @@ Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
 #define LED_FRONT_BACK 34
 
 /* Variáveis para o Edge Impulse */
-// O tamanho do buffer é definido automaticamente pela biblioteca do Edge Impulse
 float features[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE]; 
+
+/* Forward Declarations */
+void setup_wifi();
+void reconnect();
+void send_to_mqtt(const char* label, float confidence);
 
 /**
  * @brief      Setup do Arduino
@@ -31,26 +47,28 @@ void setup()
 {
     Serial.begin(115200);
     while (!Serial);
-    Serial.println("Edge Impulse Inferencing Demo - BNO055");
+    
+    // --- Configuração Wi-Fi e MQTT ---
+    setup_wifi();
+    client.setServer(mqtt_server, mqtt_port);
+
+    Serial.println("Edge Impulse Inferencing Demo - BNO055 + MQTT");
 
     // Inicializa LEDs
     pinMode(LED_UP_DOWN, OUTPUT);
     pinMode(LED_LEFT_RIGHT, OUTPUT);
     pinMode(LED_FRONT_BACK, OUTPUT);
 
-    // Garante que o I2C inicie nos pinos corretos ANTES do sensor
+    // I2C e Sensor
     Wire.begin(SDA_PIN, SCL_PIN);
-
-    // Inicializa o BNO055
     if (!bno.begin()) {
-        Serial.println("Falha ao iniciar o BNO055! Verifique a fiação.");
+        Serial.println("Falha ao iniciar o BNO055!");
         while (1) delay(1000);
     }
     bno.setExtCrystalUse(true);
 
-    // Verifica se o modelo espera o número correto de eixos (deve ser 3: X, Y, Z)
     if (EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME != 3) {
-        ei_printf("ERRO: O modelo espera %d eixos, mas o código fornece 3.\n", EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME);
+        ei_printf("ERRO: O modelo espera %d eixos.\n", EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME);
         return;
     }
 }
@@ -60,88 +78,155 @@ void setup()
  */
 void loop()
 {
-    ei_printf("\nIniciando amostragem em %d ms...\n", EI_CLASSIFIER_INTERVAL_MS);
+    // --- Garante conexão MQTT ---
+    if (!client.connected()) {
+        reconnect();
+    }
+    client.loop(); // Mantém o MQTT vivo
 
-    // 1. Preencher o buffer de dados (Amostragem)
-    // Este bloco vai ler o sensor exatamente na frequência que o modelo foi treinado
+    // ei_printf("\nIniciando amostragem...\n");
+
+    // 1. Amostragem (Coleta de dados)
     uint64_t next_tick = micros();
 
     for (int i = 0; i < EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE; i += EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME) {
-        // Define o tempo da próxima leitura
         next_tick += (uint64_t)EI_CLASSIFIER_INTERVAL_MS * 1000;
 
-        // --- Leitura do Sensor (Idêntica ao seu código de teste) ---
         imu::Vector<3> linAccel = bno.getVector(Adafruit_BNO055::VECTOR_LINEARACCEL);
 
-        // Preenche o buffer (features)
-        // NÃO MULTIPLICAR POR 9.8 (O sensor já está em m/s²)
         features[i + 0] = linAccel.x();
         features[i + 1] = linAccel.y();
         features[i + 2] = linAccel.z();
 
-        // Espera até dar o tempo exato da próxima amostra para manter a frequência correta
         if (micros() < next_tick) {
             delayMicroseconds(next_tick - micros());
         }
     }
 
-    // 2. Preparar o sinal para classificação
+    // 2. Criação do Sinal
     signal_t signal;
     int err = numpy::signal_from_buffer(features, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal);
     if (err != 0) {
-        ei_printf("Erro ao criar sinal do buffer (%d)\n", err);
+        ei_printf("Erro no buffer (%d)\n", err);
         return;
     }
 
-    // 3. Executar o Classificador (Inferência)
+    // 3. Inferência
     ei_impulse_result_t result = { 0 };
-    err = run_classifier(&signal, &result, false); // false = sem debug detalhado
+    err = run_classifier(&signal, &result, false);
     if (err != EI_IMPULSE_OK) {
-        ei_printf("ERRO: Falha ao rodar classificador (%d)\n", err);
+        ei_printf("Erro na classificação (%d)\n", err);
         return;
     }
 
-    // 4. Mostrar Resultados e Controlar LEDs
-    display_results(&result);
+    // 4. Processamento da Melhor Predição e Envio MQTT
+    process_best_result(&result);
 }
 
 /**
- * @brief      Exibe o resultado no Serial e aciona LEDs
+ * @brief      Encontra a maior probabilidade e envia para MQTT e LEDs
  */
-void display_results(ei_impulse_result_t* result)
+void process_best_result(ei_impulse_result_t* result)
 {
-    // Percorre todas as classes (labels) conhecidas pelo modelo
-    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
-        // Imprime: Nome da Classe: Probabilidade
-        ei_printf("Classe %s: %.2f\n", result->classification[ix].label, result->classification[ix].value);
+    float best_value = 0.0;
+    const char* best_label = "indefinido";
 
-        // Se a certeza for maior que 70% (0.7), aciona o LED
-        if (result->classification[ix].value > 0.7) {
-            control_leds(result->classification[ix].label);
+    // Loop para descobrir qual é a maior probabilidade
+    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+        ei_printf("%s: %.2f\n", result->classification[ix].label, result->classification[ix].value);
+        
+        if (result->classification[ix].value > best_value) {
+            best_value = result->classification[ix].value;
+            best_label = result->classification[ix].label;
         }
     }
+
+    // Só atuamos se a certeza for maior que 70%
+    if (best_value > 0.7) {
+        // Controla os LEDs
+        control_leds(best_label);
+        
+        // Envia para o MQTT
+        send_to_mqtt(best_label, best_value);
+    } else {
+        // Opcional: Apagar LEDs se não tiver certeza
+        control_leds("nenhum");
+    }
 }
 
 /**
- * @brief      Lógica dos LEDs
- * @param[in]  prediction  Nome da classe detectada
+ * @brief      Controla os LEDs
  */
 void control_leds(const char* prediction)
 {
-    // Apaga todos primeiro
     digitalWrite(LED_UP_DOWN, LOW);
     digitalWrite(LED_LEFT_RIGHT, LOW);
     digitalWrite(LED_FRONT_BACK, LOW);
 
-    // Compara o nome recebido com os nomes do seu treinamento
-    // NOTA: Os nomes devem ser IDÊNTICOS aos do Edge Impulse (Case Sensitive)
-    if (strcmp(prediction, "cima baixo") == 0 || strcmp(prediction, "cima baixo") == 0) {
+    if (strcmp(prediction, "cima baixo") == 0) {
         digitalWrite(LED_UP_DOWN, HIGH);
     } 
-    else if (strcmp(prediction, "lados") == 0 || strcmp(prediction, "lados") == 0) {
+    else if (strcmp(prediction, "lados") == 0) {
         digitalWrite(LED_LEFT_RIGHT, HIGH);
     } 
-    else if (strcmp(prediction, "frente tras") == 0 || strcmp(prediction, "frente tras") == 0) { // Evite acentos no código se possível
+    else if (strcmp(prediction, "frente tras") == 0) {
         digitalWrite(LED_FRONT_BACK, HIGH);
     }
+}
+
+// ==========================================
+// FUNÇÕES AUXILIARES DE WIFI E MQTT
+// ==========================================
+
+void setup_wifi() {
+    delay(10);
+    Serial.println();
+    Serial.print("Conectando em ");
+    Serial.println(ssid);
+
+    WiFi.begin(ssid, password);
+
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+
+    Serial.println("");
+    Serial.println("WiFi conectado");
+    Serial.println("IP: ");
+    Serial.println(WiFi.localIP());
+}
+
+void reconnect() {
+    // Loop até reconectar
+    while (!client.connected()) {
+        Serial.print("Tentando conexão MQTT...");
+        // Cria um ID de cliente aleatório
+        String clientId = "ESP32Client-";
+        clientId += String(random(0xffff), HEX);
+        
+        if (client.connect(clientId.c_str())) {
+            Serial.println("conectado");
+        } else {
+            Serial.print("falhou, rc=");
+            Serial.print(client.state());
+            Serial.println(" tentando novamente em 2 segundos");
+            delay(2000);
+        }
+    }
+}
+
+void send_to_mqtt(const char* label, float confidence) {
+    // Para não inundar o MQTT, podemos usar uma lógica simples de timer ou enviar sempre
+    // Aqui enviaremos a string do movimento
+    
+    char msg[50];
+    snprintf(msg, 50, "%s", label); // Envia apenas o nome, ex: "frente tras"
+    
+    // Se quiser enviar formato JSON:
+    // snprintf(msg, 50, "{\"movimento\":\"%s\", \"certeza\":%.2f}", label, confidence);
+
+    client.publish(mqtt_topic, msg);
+    Serial.print("MQTT Enviado: ");
+    Serial.println(msg);
 }
